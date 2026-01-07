@@ -3,34 +3,27 @@
     "only_crawl_original": 0,
     "since_date": 1,
     "start_page": 1,
-    "page_weibo_count": 10,
+    "page_weibo_count": 1,
     "write_mode": [
-        "csv"
+        "json"
     ],
     "original_pic_download": 1,
     "retweet_pic_download": 0,
-    "original_video_download": 1,
+    "original_video_download": 0,
     "retweet_video_download": 0,
-    "original_live_photo_download": 1,
+    "original_live_photo_download": 0,
     "retweet_live_photo_download": 0,
     "download_comment": 1,
-    "comment_max_download_count": 100,
+    "comment_max_download_count": 10,
     "download_repost": 1,
-    "repost_max_download_count": 100,
+    "repost_max_download_count": 10,
     "user_id_as_folder_name": 0,
     "remove_html_tag": 1,
-    "cookie": "your cookie",
-    "mysql_config": {
-        "host": "localhost",
-        "port": 3306,
-        "user": "root",
-        "password": "123456",
-        "charset": "utf8mb4"
-    },
-    "store_binary_in_sqlite": 0,
-    "mongodb_URI": "mongodb://[username:password@]host[:port][/[defaultauthdb][?options]]",
-    "post_config": {
-        "api_url": "https://api.example.com",
-        "api_token": ""
+    "cookie": "SUBP=0033WrSXqPxfM725Ws9jqgMF55529P9D9W5gL0VlHFxgFUKVdYs68CxP5JpX5KMhUgL.Fo2Reoqf1hz7e0-2dJLoIXnLxKMLB.zLB.qLxKnL12eLBo-LxK-L1-eLB.2LxKBLBonL122LxKML1-2L1hBLxK-L12BLBK2LxK-LBKBLB-zLxK-L12BLBK2t; _T_WM=3372dedab12a5a955452bac317c1e5ed; SCF=Ap1cd_szgVraMc3AErHw6JDDotVtfQqq3dp2ks80QWmtnHksvWjRL2T45QoNzpW-jHdXTgPEUXNaXlDXfHidKgI.; SUB=_2A25EWc6fDeRhGedG6VQU-CzMyDmIHXVnF05XrDV6PUJbktAbLWn1kW1NUUd-TyoUo6vqbJZlfi4Xf-f_VNcqejzx; SSOLoginState=1767751375; ALF=1770343375",
+    "stock_config": {
+        "enabled": true,
+        "zhipu_api_key": "f479a616fc774a269d5832110473d7eb.kpyc9ffh6u71Taoj",
+        "webhook_url": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=ad8eb75b-c1f1-4081-b88b-70526d318c99",
+        "model": "GLM-4.5-Flash"
     }
 }

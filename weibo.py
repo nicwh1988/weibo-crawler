@@ -19,6 +19,7 @@ from collections import OrderedDict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from time import sleep
+import pytz
 
 import requests
 from requests.exceptions import RequestException
@@ -31,6 +32,7 @@ from util import csvutil
 from util.dateutil import convert_to_days_ago
 from util.notify import push_deer
 from util.llm_analyzer import LLMAnalyzer  # 导入 LLM 分析器
+from util.stock_analyzer import StockAnalyzer  # 导入股票分析器
 
 warnings.filterwarnings("ignore")
 
@@ -145,6 +147,9 @@ class Weibo(object):
         
         # 初始化 LLM 分析器
         self.llm_analyzer = LLMAnalyzer(config) if config.get("llm_config") else None
+        
+        # 初始化股票分析器
+        self.stock_analyzer = StockAnalyzer(config) if config.get("stock_config", {}).get("enabled") else None
         
         user_id_list = config["user_id_list"]
         requests_session = requests.Session()
@@ -299,6 +304,15 @@ class Weibo(object):
         try:
             r = self.session.get(url, params=params, headers=self.headers, verify=False, timeout=10)
             r.raise_for_status()
+            
+            # 检查响应内容
+            if not r.text or r.text.strip() == "":
+                logger.error(f"服务器返回空响应，状态码：{r.status_code}")
+                return {}, r.status_code
+            
+            # 记录响应的前100个字符用于调试
+            logger.debug(f"响应内容前100字符：{r.text[:100]}")
+            
             response_json = r.json()
             return response_json, r.status_code
         except RequestException as e:
@@ -306,6 +320,9 @@ class Weibo(object):
             return {}, 500
         except ValueError as ve:
             logger.error(f"JSON 解码失败，错误信息：{ve}")
+            logger.error(f"响应状态码：{r.status_code if 'r' in locals() else '未知'}")
+            if 'r' in locals():
+                logger.error(f"响应内容（前500字符）：{r.text[:500]}")
             return {}, 500
 
     def handle_captcha(self, js):
@@ -346,6 +363,33 @@ class Weibo(object):
                 logger.error("读取用户输入时发生 EOFError，程序退出。")
                 sys.exit("输入流已关闭，程序中止。")
     
+    def _send_cookie_expired_notification(self):
+        """
+        发送cookie过期通知到企业微信
+        """
+        try:
+            # 如果配置了股票分析器，使用其webhook推送
+            if self.stock_analyzer and self.stock_analyzer.webhook_url:
+                message = {
+                    "msgtype": "text",
+                    "text": {
+                        "content": "⚠️ 微博爬虫警告\n\ncookie过期，已退出\n\n时间：" + datetime.now(pytz.timezone('Asia/Shanghai')).strftime('%Y-%m-%d %H:%M:%S')
+                    }
+                }
+                response = requests.post(
+                    self.stock_analyzer.webhook_url,
+                    json=message,
+                    timeout=5
+                )
+                if response.status_code == 200:
+                    logger.info("已成功推送cookie过期通知到企业微信")
+                else:
+                    logger.warning(f"推送cookie过期通知失败: {response.status_code}")
+            else:
+                logger.warning("未配置企业微信webhook，无法推送cookie过期通知")
+        except Exception as e:
+            logger.error(f"推送cookie过期通知时发生错误: {str(e)}")
+    
     def get_weibo_json(self, page):
         """获取网页中微博json数据"""
         url = "https://m.weibo.cn/api/container/getIndex?"
@@ -368,6 +412,19 @@ class Weibo(object):
             try:
                 response = self.session.get(url, params=params, headers=self.headers, timeout=10)
                 response.raise_for_status()  # 如果响应状态码不是 200，会抛出 HTTPError
+                
+                # 检查响应内容
+                if not response.text or response.text.strip() == "":
+                    logger.error(f"页面 {page} 返回空响应，状态码：{response.status_code}")
+                    retries += 1
+                    sleep_time = backoff_factor * (2 ** retries)
+                    logger.error(f"等待 {sleep_time} 秒后重试...")
+                    sleep(sleep_time)
+                    continue
+                
+                # 记录响应的前100个字符用于调试
+                logger.debug(f"页面 {page} 响应内容前100字符：{response.text[:100]}")
+                
                 js = response.json()
                 if 'data' in js:
                     logger.info(f"成功获取到页面 {page} 的数据。")
@@ -392,11 +449,22 @@ class Weibo(object):
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"请求失败，错误信息：{e}。等待 {sleep_time} 秒后重试...")
+                if retries >= max_retries:
+                    self._send_cookie_expired_notification()
+                    logger.error("重试次数达到上限，cookie可能已过期，程序退出。")
+                    sys.exit(1)
                 sleep(sleep_time)
             except ValueError as ve:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
                 logger.error(f"JSON 解码失败，错误信息：{ve}。等待 {sleep_time} 秒后重试...")
+                if 'response' in locals():
+                    logger.error(f"响应状态码：{response.status_code}")
+                    logger.error(f"响应内容（前500字符）：{response.text[:500]}")
+                if retries >= max_retries:
+                    self._send_cookie_expired_notification()
+                    logger.error("重试次数达到上限，cookie可能已过期，程序退出。")
+                    sys.exit(1)
                 sleep(sleep_time)
         logger.error("超过最大重试次数，跳过当前页面。")
         return {}
@@ -531,9 +599,22 @@ class Weibo(object):
         
         while retries < max_retries:
             try:
-                logger.info(f"准备获取ID：{self.user_config['user_id']}的用户信息第{retries+1}次。")
                 response = self.session.get(url, params=params, headers=self.headers, timeout=10)
+                logger.debug(f"请求URL: {url}, 参数: {params}")
+                logger.debug(f"响应状态码: {response.status_code}")
+                logger.debug(f"响应头: {dict(response.headers)}")
+                logger.debug(f"响应内容前500字符: {response.text[:500]}")
                 response.raise_for_status()
+                
+                # 检查响应内容是否为空
+                if not response.text or response.text.strip() == "":
+                    raise ValueError(f"响应内容为空，状态码: {response.status_code}")
+                
+                # 检查响应内容是否看起来像JSON
+                if not response.text.strip().startswith('{') and not response.text.strip().startswith('['):
+                    logger.error(f"响应内容不是JSON格式，内容: {response.text[:500]}")
+                    raise ValueError(f"响应内容不是JSON格式")
+                
                 js = response.json()
                 if 'data' in js and 'userInfo' in js['data']:
                     info = js["data"]["userInfo"]
@@ -589,7 +670,7 @@ class Weibo(object):
                     self.user_to_database()
                     logger.info(f"成功获取到用户 {self.user_config['user_id']} 的信息。")
                     return 0
-                elif isinstance(js.get("url"), str) and js.get("url").strip():
+                else:
                     logger.warning("未能获取到用户信息，可能需要验证码验证。")
                     if self.handle_captcha(js):
                         logger.info("用户已完成验证码验证，继续请求用户信息。")
@@ -598,22 +679,45 @@ class Weibo(object):
                     else:
                         logger.error("验证码验证失败或未完成，程序将退出。")
                         sys.exit()
-                elif isinstance(js.get("msg"), str) and "这里还没有内容" in js.get("msg"):
-                    logger.warning("未能获取到用户信息，可能账号已注销或用户id有误。")
-                    return 1
-                else:
-                    logger.warning("未能获取到用户信息。")
-                    return 1
+            except (ValueError, json.JSONDecodeError) as ve:
+                retries += 1
+                sleep_time = backoff_factor * (2 ** retries)
+                logger.error(f"JSON 解码失败，错误信息：{ve}")
+                logger.error(f"请求URL: {url}, 参数: {params}")
+                if 'response' in locals():
+                    logger.error(f"响应状态码: {response.status_code}")
+                    logger.error(f"响应内容类型: {response.headers.get('Content-Type', 'unknown')}")
+                    logger.error(f"响应内容长度: {len(response.text)} 字符")
+                    logger.error(f"响应内容前1000字符: {response.text[:1000]}")
+                logger.error(f"重试次数: {retries}/{max_retries}, 等待 {sleep_time} 秒后重试...")
+                sleep(sleep_time)
             except RequestException as e:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
-                logger.error(f"请求失败，错误信息：{e}。等待 {sleep_time} 秒后重试...")
+                logger.error(f"请求失败（网络错误），错误信息：{e}")
+                logger.error(f"请求URL: {url}, 参数: {params}")
+                logger.error(f"重试次数: {retries}/{max_retries}, 等待 {sleep_time} 秒后重试...")
+                if retries >= max_retries:
+                    self._send_cookie_expired_notification()
+                    logger.error("重试次数达到上限，cookie可能已过期，程序退出。")
+                    sys.exit("超过最大重试次数，程序已退出。")
                 sleep(sleep_time)
-            except ValueError as ve:
+            except Exception as e:
                 retries += 1
                 sleep_time = backoff_factor * (2 ** retries)
-                logger.error(f"JSON 解码失败，错误信息：{ve}。等待 {sleep_time} 秒后重试...")
+                logger.error(f"未知错误: {type(e).__name__} - {e}")
+                logger.error(f"请求URL: {url}, 参数: {params}")
+                if 'response' in locals():
+                    logger.error(f"响应状态码: {response.status_code}")
+                    logger.error(f"响应内容前500字符: {response.text[:500]}")
+                logger.error(f"重试次数: {retries}/{max_retries}, 等待 {sleep_time} 秒后重试...")
+                if retries >= max_retries:
+                    self._send_cookie_expired_notification()
+                    logger.error("重试次数达到上限，cookie可能已过期，程序退出。")
+                    sys.exit("超过最大重试次数，程序已退出。")
                 sleep(sleep_time)
+        # 如果循环正常退出（没有通过异常退出），也发送通知并退出
+        self._send_cookie_expired_notification()
         logger.error("超过最大重试次数，程序将退出。")
         sys.exit("超过最大重试次数，程序已退出。")
 
@@ -1004,6 +1108,7 @@ class Weibo(object):
                 and "int" not in str(type(v))
                 and "list" not in str(type(v))
                 and "long" not in str(type(v))
+                and "dict" not in str(type(v))
             ):
                 weibo[k] = (
                     v.replace("\u200b", "")
@@ -1057,6 +1162,11 @@ class Weibo(object):
         if self.llm_analyzer:
             weibo = self.llm_analyzer.analyze_weibo(weibo)
             logger.info("完整分析结果：\n%s", json.dumps(weibo, ensure_ascii=False, indent=2))
+        
+        # 使用股票分析器识别和推送股票相关内容
+        if self.stock_analyzer:
+            weibo = self.stock_analyzer.analyze_and_push(weibo)
+        
         return self.standardize_info(weibo)
 
     def print_user_info(self):
@@ -1387,6 +1497,10 @@ class Weibo(object):
                 
                 if self.query:
                     weibos = weibos[0]["card_group"]
+                
+                # 检查第一条微博（最新微博）是否已经爬取过
+                first_weibo_checked = False
+                
                 # 如果需要检查cookie，在循环第一个人的时候，就要看看仅自己可见的信息有没有，要是没有直接报错
                 for w in weibos:
                     if w["card_type"] == 11:
@@ -1398,6 +1512,22 @@ class Weibo(object):
                     if w["card_type"] == 9:
                         wb = self.get_one_weibo(w)
                         if wb:
+                            # 检查第一条有效微博是否已爬取过
+                            if not first_weibo_checked:
+                                first_weibo_checked = True
+                                if wb["id"] in self.existing_weibo_ids:
+                                    sleep_time = random.randint(60, 180)
+                                    logger.info("=" * 100)
+                                    logger.warning(f"检测到当前用户 {self.user['screen_name']} 最新微博ID {wb['id']} 已经被爬取过")
+                                    logger.info("微博内容: {0}".format(wb['text'][:50] + '...' if len(wb['text']) > 50 else wb['text']))
+                                    logger.warning(f"暂停{sleep_time}秒后重新检查是否有新微博...")
+                                    logger.info("=" * 100)
+                                    sleep(sleep_time)
+                                    # 重新加载已存在的微博ID，以便下次检测
+                                    self.existing_weibo_ids = self.load_existing_weibo_ids()
+                                    # 返回True表示本次爬取结束，但不退出程序
+                                    return True
+                            
                             if (
                                 const.CHECK_COOKIE["CHECK"]
                                 and (not const.CHECK_COOKIE["CHECKED"])
@@ -1650,23 +1780,21 @@ class Weibo(object):
         """更新要写入json结果文件中的数据，已经存在于json中的信息更新为最新值，不存在的信息添加到data中"""
         data["user"] = self.user
         if data.get("weibo"):
-            is_new = 1  # 待写入微博是否全部为新微博，即待写入微博与json中的数据不重复
-            for old in data["weibo"]:
-                if weibo_info[-1]["id"] == old["id"]:
-                    is_new = 0
-                    break
-            if is_new == 0:
-                for new in weibo_info:
-                    flag = 1
+            # 创建现有微博ID的集合，用于快速查找
+            existing_ids = {old["id"] for old in data["weibo"]}
+            
+            # 遍历所有待写入的微博
+            for new in weibo_info:
+                if new["id"] in existing_ids:
+                    # 如果微博已存在，更新为最新值
                     for i, old in enumerate(data["weibo"]):
                         if new["id"] == old["id"]:
                             data["weibo"][i] = new
-                            flag = 0
                             break
-                    if flag:
-                        data["weibo"].append(new)
-            else:
-                data["weibo"] += weibo_info
+                else:
+                    # 如果微博不存在，添加到列表
+                    data["weibo"].append(new)
+                    existing_ids.add(new["id"])
         else:
             data["weibo"] = weibo_info
         return data
@@ -2389,6 +2517,10 @@ class Weibo(object):
             if self.get_user_info() != 0:
                 return
             logger.info("准备搜集 {} 的微博".format(self.user["screen_name"]))
+            
+            # 加载已存在的微博ID，用于检测重复
+            self.existing_weibo_ids = self.load_existing_weibo_ids()
+            
             if const.MODE == "append" and (
                 "first_crawler" not in self.__dict__ or self.first_crawler is False
             ):
@@ -2398,30 +2530,52 @@ class Weibo(object):
             since_date = datetime.strptime(self.user_config["since_date"], DTFORMAT)
             today = datetime.today()
             if since_date <= today:    # since_date 若为未来则无需执行
-                page_count = self.get_page_count()
-                wrote_count = 0
-                page1 = 0
-                random_pages = random.randint(1, 5)
-                self.start_date = datetime.now().strftime(DTFORMAT)
-                pages = range(self.start_page, page_count + 1)
-                for page in tqdm(pages, desc="Progress"):
-                    is_end = self.get_one_page(page)
-                    if is_end:
-                        break
+                # 持续监控循环
+                while True:
+                    # 检查是否在休息时间
+                    self.wait_until_work_time()
+                    
+                    page_count = self.get_page_count()
+                    wrote_count = 0
+                    page1 = 0
+                    random_pages = random.randint(1, 5)
+                    self.start_date = datetime.now().strftime(DTFORMAT)
+                    pages = range(self.start_page, page_count + 1)
+                    
+                    # 记录本轮爬取前的微博数量
+                    got_count_before = self.got_count
+                    
+                    for page in tqdm(pages, desc="Progress"):
+                        is_end = self.get_one_page(page)
+                        if is_end:
+                            # 如果检测到重复微博（已在get_one_page中暂停60秒）
+                            # 在退出前先保存本轮已爬取的微博
+                            if self.got_count > wrote_count:
+                                self.write_data(wrote_count)
+                                wrote_count = self.got_count
+                                logger.info("检测到重复微博前已爬取%d条新微博，已保存", 
+                                          self.got_count - got_count_before)
+                            # 重新开始下一轮检查
+                            break
 
-                    if page % 20 == 0:  # 每爬20页写入一次文件
-                        self.write_data(wrote_count)
-                        wrote_count = self.got_count
+                        if page % 20 == 0:  # 每爬20页写入一次文件
+                            self.write_data(wrote_count)
+                            wrote_count = self.got_count
 
-                    # 通过加入随机等待避免被限制。爬虫速度过快容易被系统限制(一段时间后限
-                    # 制会自动解除)，加入随机等待模拟人的操作，可降低被系统限制的风险。默
-                    # 认是每爬取1到5页随机等待6到10秒，如果仍然被限，可适当增加sleep时间
-                    if (page - page1) % random_pages == 0 and page < page_count:
-                        sleep(random.randint(6, 10))
-                        page1 = page
-                        random_pages = random.randint(1, 5)
+                        # 通过加入随机等待避免被限制。爬虫速度过快容易被系统限制(一段时间后限
+                        # 制会自动解除)，加入随机等待模拟人的操作，可降低被系统限制的风险。默
+                        # 认是每爬取1到5页随机等待6到10秒，如果仍然被限，可适当增加sleep时间
+                        if (page - page1) % random_pages == 0 and page < page_count:
+                            sleep(random.randint(6, 10))
+                            page1 = page
+                            random_pages = random.randint(1, 5)
 
-                self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
+                    # 如果本轮有新微博，写入文件
+                    if self.got_count > got_count_before:
+                        self.write_data(wrote_count)  # 将剩余不足20页的微博写入文件
+                        logger.info("本轮爬取完成，新增%d条微博，累计爬取%d条微博", 
+                                  self.got_count - got_count_before, self.got_count)
+                    
             logger.info("微博爬取完成，共爬取%d条微博", self.got_count)
         except Exception as e:
             logger.exception(e)
@@ -2464,6 +2618,91 @@ class Weibo(object):
                     if user_config not in user_config_list:
                         user_config_list.append(user_config)
         return user_config_list
+    
+    def load_existing_weibo_ids(self):
+        """从JSON文件中加载已存在的微博ID列表"""
+        existing_ids = set()
+        try:
+            # 需要user信息才能确定文件路径，所以可能暂时无法获取
+            if not hasattr(self, 'user') or not self.user:
+                return existing_ids
+                
+            path = self.get_filepath("json")
+            if os.path.isfile(path):
+                with codecs.open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data.get("weibo"):
+                        for weibo in data["weibo"]:
+                            existing_ids.add(weibo["id"])
+                logger.info(f"已加载 {len(existing_ids)} 条已存在的微博ID")
+        except Exception as e:
+            logger.warning(f"加载已存在微博ID时出错: {e}")
+        return existing_ids
+    
+    def is_rest_time(self):
+        """检查当前是否在休息时间段（北京时间 16:00-次日9:00）"""
+        try:
+            # 获取北京时间
+            beijing_tz = pytz.timezone('Asia/Shanghai')
+            beijing_time = datetime.now(beijing_tz)
+            current_hour = beijing_time.hour
+            
+            # 16:00-23:59 或 0:00-8:59 为休息时间
+            if current_hour >= 16 or current_hour < 9:
+                return True, beijing_time
+            return False, beijing_time
+        except Exception as e:
+            logger.warning(f"检查休息时间出错: {e}")
+            # 出错时假设不是休息时间，继续运行
+            return False, datetime.now()
+    
+    def wait_until_work_time(self):
+        """等待到工作时间（北京时间 9:00）"""
+        is_rest, beijing_time = self.is_rest_time()
+        
+        if not is_rest:
+            return  # 已经是工作时间，直接返回
+        
+        current_hour = beijing_time.hour
+        current_minute = beijing_time.minute
+        
+        # 计算到次日9:00的等待时间
+        if current_hour >= 16:
+            # 当前在下午16:00-23:59，等待到次日9:00
+            hours_to_wait = (24 - current_hour) + 9
+        else:
+            # 当前在凌晨0:00-8:59，等待到今日9:00
+            hours_to_wait = 9 - current_hour
+        
+        # 减去当前的分钟数
+        minutes_to_wait = hours_to_wait * 60 - current_minute
+        seconds_to_wait = minutes_to_wait * 60
+        
+        logger.info("=" * 100)
+        logger.info(f"当前北京时间: {beijing_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"现在是休息时间（16:00-次日9:00），暂停爬取")
+        logger.info(f"预计将在 {(beijing_time + timedelta(seconds=seconds_to_wait)).strftime('%Y-%m-%d %H:%M:%S')} 恢复爬取")
+        logger.info(f"等待时长: {hours_to_wait}小时{minutes_to_wait % 60}分钟")
+        logger.info("=" * 100)
+        
+        # 分段等待，每30分钟检查一次，避免一次性等待太久
+        check_interval = 30 * 60  # 30分钟
+        remaining = seconds_to_wait
+        
+        while remaining > 0:
+            wait_time = min(check_interval, remaining)
+            sleep(wait_time)
+            remaining -= wait_time
+            
+            # 重新检查是否还在休息时间
+            is_rest, current_time = self.is_rest_time()
+            if not is_rest:
+                logger.info(f"当前北京时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logger.info("已到工作时间，恢复爬取...")
+                return
+            
+            if remaining > 0:
+                logger.info(f"继续等待，剩余约 {remaining // 60} 分钟...")
 
     def initialize_info(self, user_config):
         """初始化爬虫信息"""
@@ -2472,6 +2711,7 @@ class Weibo(object):
         self.user_config = user_config
         self.got_count = 0
         self.weibo_id_list = []
+        self.existing_weibo_ids = self.load_existing_weibo_ids()
 
     def start(self):
         """运行爬虫"""
