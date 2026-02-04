@@ -392,6 +392,10 @@ class Weibo(object):
     
     def get_weibo_json(self, page):
         """获取网页中微博json数据"""
+        # 限制最多获取100页
+        if page > 100:
+            logger.warning(f"页码 {page} 超过最大限制100页，停止获取")
+            return None
         url = "https://m.weibo.cn/api/container/getIndex?"
         params = (
             {

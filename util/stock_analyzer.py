@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional
 from datetime import datetime
 import pytz
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("weibo")
 
 
 class StockAnalyzer:
@@ -26,6 +26,7 @@ class StockAnalyzer:
         self.api_key = self.stock_config.get('zhipu_api_key')
         self.webhook_url = self.stock_config.get('webhook_url')
         self.model = self.stock_config.get('model', 'glm-4-flash')
+        self.max_retries = self.stock_config.get('max_retries', 3)  # API调用失败重试次数
         
         # 添加已推送微博ID集合，防止重复推送
         self.pushed_weibo_ids = set()
@@ -50,14 +51,13 @@ class StockAnalyzer:
         if not self.enabled or not self.api_key:
             return False, ""
         
-        try:
-            # 使用智谱AI的官方API格式
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json"
-            }
-            
-            prompt = f"""请判断以下微博内容是否与股票、证券、投资相关。
+        # 使用智谱AI的官方API格式
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        prompt = f"""请判断以下微博内容是否与股票、证券、投资相关。
 如果相关，请简要说明涉及的股票信息（如股票代码、公司名称、投资观点等）；
 如果不相关，只回复"不相关"。
 
@@ -65,47 +65,56 @@ class StockAnalyzer:
 {text}
 
 请直接回答，不要有多余的解释。"""
-            
-            data = {
-                "model": self.model,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "你是一个专业的股票内容识别助手。"
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                "temperature": 0.3,  # 降低温度以获得更确定的结果
-                "max_tokens": 500
-            }
-            
-            # 智谱AI的API endpoint
-            response = requests.post(
-                "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                analysis = result['choices'][0]['message']['content'].strip()
+        
+        data = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "你是一个专业的股票内容识别助手。"
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.3,  # 降低温度以获得更确定的结果
+            "max_tokens": 500
+        }
+        
+        # 重试机制
+        for attempt in range(self.max_retries):
+            try:
+                # 智谱AI的API endpoint
+                response = requests.post(
+                    "https://open.bigmodel.cn/api/paas/v4/chat/completions",
+                    headers=headers,
+                    json=data,
+                    timeout=30
+                )
                 
-                # 判断是否相关
-                is_related = "不相关" not in analysis
-                
-                logger.info(f"股票识别结果: {'相关' if is_related else '不相关'} - {analysis}")
-                return is_related, analysis
-            else:
-                logger.error(f"智谱AI API调用失败: {response.status_code} - {response.text}")
+                if response.status_code == 200:
+                    result = response.json()
+                    analysis = result['choices'][0]['message']['content'].strip()
+                    
+                    # 判断是否相关
+                    is_related = "不相关" not in analysis
+                    
+                    logger.info(f"股票识别结果: {'相关' if is_related else '不相关'} - {analysis}")
+                    return is_related, analysis
+                else:
+                    logger.error(f"智谱AI API调用失败(第{attempt + 1}次): {response.status_code} - {response.text}")
+                    if attempt < self.max_retries - 1:
+                        continue
+                    return False, ""
+                    
+            except Exception as e:
+                logger.error(f"股票内容识别失败(第{attempt + 1}次): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    continue
                 return False, ""
-                
-        except Exception as e:
-            logger.error(f"股票内容识别失败: {str(e)}")
-            return False, ""
+        
+        return False, ""
     
     def push_to_weixin(self, content: str, weibo_data: Dict[str, Any]) -> bool:
         """
