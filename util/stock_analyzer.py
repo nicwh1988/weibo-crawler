@@ -3,6 +3,7 @@
 
 import json
 import logging
+import time
 import requests
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -26,7 +27,7 @@ class StockAnalyzer:
         self.api_key = self.stock_config.get('zhipu_api_key')
         self.webhook_url = self.stock_config.get('webhook_url')
         self.model = self.stock_config.get('model', 'glm-4-flash')
-        self.max_retries = self.stock_config.get('max_retries', 3)  # API调用失败重试次数
+        self.max_retries = self.stock_config.get('max_retries', 10)  # API调用失败重试次数
         
         # 添加已推送微博ID集合，防止重复推送
         self.pushed_weibo_ids = set()
@@ -105,14 +106,16 @@ class StockAnalyzer:
                 else:
                     logger.error(f"智谱AI API调用失败(第{attempt + 1}次): {response.status_code} - {response.text}")
                     if attempt < self.max_retries - 1:
+                        time.sleep(1)
                         continue
-                    return False, ""
+                    return True, ""
                     
             except Exception as e:
                 logger.error(f"股票内容识别失败(第{attempt + 1}次): {str(e)}")
                 if attempt < self.max_retries - 1:
+                    time.sleep(1)
                     continue
-                return False, ""
+                return True, ""
         
         return False, ""
     

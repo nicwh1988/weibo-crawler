@@ -1492,18 +1492,24 @@ class Weibo(object):
         """获取一页的全部微博"""
         try:
             js = self.get_weibo_json(page)
+            if js is None:
+                logger.warning(f"第{page}页未获取到数据，停止获取")
+                return True
             import json
             with open('js.json','w') as f:
-                #写入方式1，等价于下面这行
-                json.dump(js,f) #把列表numbers内容写入到"list.json"文件中
+                json.dump(js,f)
             if js["ok"]:
                 weibos = js["data"]["cards"]
                 
                 if self.query:
                     weibos = weibos[0]["card_group"]
                 
-                # 检查第一条微博（最新微博）是否已经爬取过
-                first_weibo_checked = False
+                # 检查前N条微博是否已经爬取过（防止置顶微博导致误判）
+                # 需要前5条都已爬取过，才认为没有新微博
+                existing_check_threshold = 5
+                existing_check_count = 0  # 已检查的微博数量
+                existing_check_hit = 0    # 其中已爬取过的数量
+                existing_check_done = False  # 检查阶段是否已完成
                 
                 # 如果需要检查cookie，在循环第一个人的时候，就要看看仅自己可见的信息有没有，要是没有直接报错
                 for w in weibos:
@@ -1516,21 +1522,39 @@ class Weibo(object):
                     if w["card_type"] == 9:
                         wb = self.get_one_weibo(w)
                         if wb:
-                            # 检查第一条有效微博是否已爬取过
-                            if not first_weibo_checked:
-                                first_weibo_checked = True
-                                if wb["id"] in self.existing_weibo_ids:
-                                    sleep_time = random.randint(60, 180)
-                                    logger.info("=" * 100)
-                                    logger.warning(f"检测到当前用户 {self.user['screen_name']} 最新微博ID {wb['id']} 已经被爬取过")
-                                    logger.info("微博内容: {0}".format(wb['text'][:50] + '...' if len(wb['text']) > 50 else wb['text']))
-                                    logger.warning(f"暂停{sleep_time}秒后重新检查是否有新微博...")
-                                    logger.info("=" * 100)
-                                    sleep(sleep_time)
-                                    # 重新加载已存在的微博ID，以便下次检测
-                                    self.existing_weibo_ids = self.load_existing_weibo_ids()
-                                    # 返回True表示本次爬取结束，但不退出程序
-                                    return True
+                            # === 前N条检查阶段：判断是否全部已爬取过 ===
+                            if not existing_check_done and existing_check_count < existing_check_threshold:
+                                existing_check_count += 1
+                                is_existing = wb["id"] in self.existing_weibo_ids
+                                if is_existing:
+                                    existing_check_hit += 1
+                                logger.info(f"检查第{existing_check_count}/{existing_check_threshold}条微博"
+                                           f"(ID:{wb['id']}) - {'已爬取' if is_existing else '新微博'}"
+                                           f" [已爬取数: {existing_check_hit}]")
+                                
+                                if existing_check_count >= existing_check_threshold:
+                                    # 检查完毕，判断结果
+                                    if existing_check_hit >= existing_check_threshold:
+                                        # 全部已爬取，暂停等待新微博
+                                        sleep_time = random.randint(60, 180)
+                                        logger.info("=" * 100)
+                                        logger.warning(f"检测到当前用户 {self.user['screen_name']} 前{existing_check_threshold}条微博全部已爬取过")
+                                        logger.warning(f"暂停{sleep_time}秒后重新检查是否有新微博...")
+                                        logger.info("=" * 100)
+                                        sleep(sleep_time)
+                                        self.existing_weibo_ids = self.load_existing_weibo_ids()
+                                        return True
+                                    else:
+                                        # 存在新微博，结束检查阶段，进入正常爬取
+                                        existing_check_done = True
+                                        logger.info(f"前{existing_check_threshold}条中有{existing_check_threshold - existing_check_hit}条新微博，开始正常爬取")
+                                elif not is_existing:
+                                    # 提前发现新微博，直接结束检查阶段
+                                    existing_check_done = True
+                                    logger.info(f"第{existing_check_count}条发现新微博，跳过剩余检查，开始正常爬取")
+                                else:
+                                    # 还在检查中，当前微博已存在，跳过不处理
+                                    continue
                             
                             if (
                                 const.CHECK_COOKIE["CHECK"]
